@@ -1,0 +1,48 @@
+From 97ba2ec062484608c766a33e9a84f5f4e24b6fa5 Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 18:53:49 -0400
+Subject: [PATCH 07/19] Keep streaming after a failed frame capture
+
+The capture-failure branch set response = ESP_FAIL and continued, so
+the next good frame skipped every send and hit the break: one dropped
+capture closed the client's stream despite the try-to-recover intent.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/CameraManager/CameraManager/CameraManager.cpp | 2 --
+ components/StreamServer/StreamServer/StreamServer.cpp    | 5 +++--
+ 2 files changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/components/CameraManager/CameraManager/CameraManager.cpp b/components/CameraManager/CameraManager/CameraManager.cpp
+index bd588e1..da931e6 100644
+--- a/components/CameraManager/CameraManager/CameraManager.cpp
++++ b/components/CameraManager/CameraManager/CameraManager.cpp
+@@ -7,8 +7,6 @@
+ #include <cstdlib>
+ #include <cstring>
+ 
+-#include <algorithm>
+-
+ const char* CAMERA_MANAGER_TAG = "[CAMERA_MANAGER]";
+ 
+ namespace
+diff --git a/components/StreamServer/StreamServer/StreamServer.cpp b/components/StreamServer/StreamServer/StreamServer.cpp
+index cd66088..1b04082 100644
+--- a/components/StreamServer/StreamServer/StreamServer.cpp
++++ b/components/StreamServer/StreamServer/StreamServer.cpp
+@@ -70,9 +70,10 @@ esp_err_t StreamHelpers::stream(httpd_req_t* req)
+ 
+             if (!fb)
+             {
++                // Don't break, try to recover. Leave `response` alone: setting it here made the
++                // next good frame skip sending and hit the break below, so one dropped capture
++                // closed the client's stream.
+                 ESP_LOGE(STREAM_SERVER_TAG, "Camera capture failed");
+-                response = ESP_FAIL;
+-                // Don't break immediately, try to recover
+                 vTaskDelay(pdMS_TO_TICKS(10));
+                 continue;
+             }
+-- 
+2.54.0.windows.1
+

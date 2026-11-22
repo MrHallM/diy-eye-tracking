@@ -1,0 +1,32 @@
+From 8e3f080427726bc4e22928fe9d6d3f5c46c51e04 Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 18:59:04 -0400
+Subject: [PATCH 08/19] XIAO: keep the Wi-Fi camera clock at 23 MHz
+
+With XCLK now chosen by device mode, Wi-Fi fell to the 16.5 MHz base
+default and dropped the OV2640 from 64-66 fps to 44 fps. 23 MHz restores
+64.4 fps; the 160 MHz CPU from the same change costs no fps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ boards/seed_studio/xiao_esp32s3 | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/boards/seed_studio/xiao_esp32s3 b/boards/seed_studio/xiao_esp32s3
+index c58e7d0..996386c 100644
+--- a/boards/seed_studio/xiao_esp32s3
++++ b/boards/seed_studio/xiao_esp32s3
+@@ -66,6 +66,10 @@ CONFIG_SPIRAM_SPEED=80
+ CONFIG_SPIRAM_SPEED_80M=y
+ # CONFIG_LED_EXTERNAL_CONTROL is not set
+ CONFIG_CAMERA_USB_XCLK_FREQ=23000000
++# Keep Wi-Fi at the clock it effectively ran at before XCLK became mode-aware: the 16.5 MHz
++# base default measured 44 fps vs 64-66 fps at 23 MHz (OV2640, 240x240, XIAO, 2026-10-15).
++# The 160 MHz CPU cost no fps, so it stays for the heat saving.
++CONFIG_CAMERA_WIFI_XCLK_FREQ=23000000
+ CONFIG_GENERAL_INCLUDE_UVC_MODE=y
+ # CONFIG_START_IN_UVC_MODE is not set
+ # CONFIG_MONITORING_LED_CURRENT is not set
+-- 
+2.54.0.windows.1
+

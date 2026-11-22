@@ -1,0 +1,65 @@
+From 5c742e68f3d380b2ec3eda8ef4cd9c7c93b720b6 Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 21:09:36 -0400
+Subject: [PATCH 19/19] Stream: flush the driver's buffered frames when
+ streaming resumes
+
+The camera driver keeps fb_count frames captured before the stream went idle, so
+the first frames a new viewer got were from then (seen: board_ts 1.6 s, then
+50.4 s). Drop them on resume; first frames are now consecutive and current.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../StreamServer/StreamServer/StreamServer.cpp  | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/components/StreamServer/StreamServer/StreamServer.cpp b/components/StreamServer/StreamServer/StreamServer.cpp
+index 11861a1..e26643e 100644
+--- a/components/StreamServer/StreamServer/StreamServer.cpp
++++ b/components/StreamServer/StreamServer/StreamServer.cpp
+@@ -165,6 +165,9 @@ esp_err_t StreamHelpers::stream(httpd_req_t* req)
+ // latest frame out to every client. With a single client this is the same capture cadence as
+ // before plus one small memcpy per frame.
+ // ---------------------------------------------------------------------------------------------
++// CameraManager runs the driver with fb_count = 2
++#define CONFIG_CAMERA_FB_FLUSH_ON_RESUME 2
++
+ namespace
+ {
+ struct SharedFrame
+@@ -190,6 +193,7 @@ void CaptureTask(void*)
+ {
+     int64_t windowStart = esp_timer_get_time();
+     int windowFrames = 0;
++    bool idle = true;
+ 
+     while (true)
+     {
+@@ -198,11 +202,24 @@ void CaptureTask(void*)
+             if (hub.clients == 0)
+             {
+                 lock.unlock();
++                idle = true;
+                 vTaskDelay(pdMS_TO_TICKS(20));
+                 continue;
+             }
+         }
+ 
++        if (idle)
++        {
++            // the driver still holds frame buffers captured before we went idle (fb_count of them);
++            // drop those so a new viewer's first frames are current, not seconds or minutes old
++            for (int i = 0; i < CONFIG_CAMERA_FB_FLUSH_ON_RESUME; i++)
++            {
++                if (camera_fb_t* stale = esp_camera_fb_get())
++                    esp_camera_fb_return(stale);
++            }
++            idle = false;
++        }
++
+         auto frame = std::make_shared<SharedFrame>();
+         const bool cameraFailed = hub.ctx.stateManager && hub.ctx.stateManager->GetCameraState() == CameraState_e::Camera_Error;
+         const uint8_t* diagBuf = nullptr;
+-- 
+2.54.0.windows.1
+

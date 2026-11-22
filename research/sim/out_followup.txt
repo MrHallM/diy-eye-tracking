@@ -1,0 +1,12 @@
+A. per-axis floor, 5 deg noise, gate 'fix + still + >=0.5 s' (deg; median / 95th)
+   120s  horizontal 0.89 / 3.28   vertical 1.23 / 4.65
+   300s  horizontal 0.66 / 2.39   vertical 0.94 / 3.39
+   600s  horizontal 0.45 / 1.58   vertical 0.57 / 3.23
+   horizontal-only step detection (77 recordings >= 10 min; median/90th s, detected %)
+   window 120s (threshold 3.28)   2 deg:  112/ 177s  44%   3 deg:  105/ 200s  66%   5 deg:   85/ 142s  83%
+   window 300s (threshold 2.39)   2 deg:  275/ 508s  71%   3 deg:  220/ 362s  82%   5 deg:  157/ 235s  94%
+
+B. vertical eye centre vs head orientation
+   HeadOrnt row 0: across sessions r=-0.28 (vertical centre SD 6.22 -> 5.98 deg after fit)   within sessions r=-0.27, slope -0.20 deg eye per deg head
+   HeadOrnt row 1: across sessions r=-0.05 (vertical centre SD 6.22 -> 6.22 deg after fit)   within sessions r=+0.01, slope +0.02 deg eye per deg head
+   HeadOrnt row 2: across sessions r=-0.00 (vertical centre SD 6.22 -> 6.22 deg after fit)   within sessions r=+0.00, slope +0.00 deg eye per deg head

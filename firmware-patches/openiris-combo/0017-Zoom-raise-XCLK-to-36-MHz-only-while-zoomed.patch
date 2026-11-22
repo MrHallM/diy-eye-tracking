@@ -1,0 +1,43 @@
+From 8751a4c19c1bf77e192123eb0a2bd1d9d69ee49e Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 21:00:14 -0400
+Subject: [PATCH 17/19] Zoom: raise XCLK to 36 MHz only while zoomed
+
+SVGA mode halves the frame rate (33 fps at 23 MHz); 36 MHz while zoomed gives
+~50 fps for ~+5 C at the ESP32. The full view keeps the configured clock, since
+~67 fps is already past what VRChat can show. Measured: 66 -> 50 -> 66 fps
+across zoom on/off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/CameraManager/CameraManager/CameraManager.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/components/CameraManager/CameraManager/CameraManager.cpp b/components/CameraManager/CameraManager/CameraManager.cpp
+index a11bbfc..716fdf0 100644
+--- a/components/CameraManager/CameraManager/CameraManager.cpp
++++ b/components/CameraManager/CameraManager/CameraManager.cpp
+@@ -380,6 +380,7 @@ int CameraManager::setVieWindow(int offsetX, int offsetY, int outputX, int outpu
+     if (outputX == 0)
+     {
+         zoomSize = 0;
++        camera_sensor->set_xclk(camera_sensor, config.ledc_timer, config.xclk_freq_hz / 1000000);
+         const int ret = this->setCameraResolution(static_cast<framesize_t>(projectConfig->getCameraConfig().framesize));
+         this->applyGainAndExposure();  // the mode switch rewrites the sensor's register tables
+         return ret;
+@@ -394,6 +395,12 @@ int CameraManager::setVieWindow(int offsetX, int offsetY, int outputX, int outpu
+         return -1;
+     }
+ 
++    // SVGA mode reads twice the rows, which halves the frame rate (33 fps at 23 MHz). A faster XCLK
++    // only while zoomed wins most of it back: 36 MHz measured ~50 fps zoomed, ~+5 C at the ESP32.
++    // Full view stays on the configured clock: its ~67 fps is already past what VRChat can show.
++    constexpr int ZOOM_XCLK_MHZ = 36;
++    camera_sensor->set_xclk(camera_sensor, config.ledc_timer, ZOOM_XCLK_MHZ);
++
+     const auto& res = resolution[camera_sensor->status.framesize];
+     const int ret = camera_sensor->set_res_raw(camera_sensor, OV2640_MODE_SVGA, 0, 0, 0, offsetX, offsetY, outputX, outputY, res.width, res.height, false, false);
+     this->applyGainAndExposure();
+-- 
+2.54.0.windows.1
+

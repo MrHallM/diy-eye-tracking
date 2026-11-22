@@ -1,0 +1,31 @@
+From 356cc54d78f32bcac46898687af481aad8f3b81f Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:56:32 -0400
+Subject: [PATCH 3/6] IP camera: decode exactly the frame's bytes
+
+TrimEnd() scanned the whole reused 1 MB buffer per frame and, since the buffer
+is never cleared, kept stale bytes of earlier larger frames.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Baballonia.IPCameraCapture/IPCameraCapture.cs | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/Baballonia.IPCameraCapture/IPCameraCapture.cs b/src/Baballonia.IPCameraCapture/IPCameraCapture.cs
+index d9afac6..83fb7a9 100644
+--- a/src/Baballonia.IPCameraCapture/IPCameraCapture.cs
++++ b/src/Baballonia.IPCameraCapture/IPCameraCapture.cs
+@@ -127,7 +127,9 @@ public sealed class IpCameraCapture(string url, ILogger<IpCameraCapture> logger)
+                 {
+                     try
+                     {
+-                        var mat = Mat.FromImageData(TrimEnd(frameBuffer));
++                        // decode exactly this frame's bytes; TrimEnd() scanned the whole 1 MB buffer per frame
++                        // and, since the buffer is reused, kept stale bytes from earlier, larger frames
++                        var mat = Mat.FromImageData(frameBuffer.AsSpan(0, frameIdx).ToArray());
+                         SetRawMat(mat);
+                     }
+                     catch (Exception)
+-- 
+2.54.0.windows.1
+

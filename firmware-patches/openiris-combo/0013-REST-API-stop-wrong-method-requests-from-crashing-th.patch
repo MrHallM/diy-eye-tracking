@@ -1,0 +1,41 @@
+From bf29df156df31d3391e41fd608e1633a3aa0801a Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 19:55:59 -0400
+Subject: [PATCH 13/19] REST API: stop wrong-method requests from crashing the
+ board
+
+The 405 reply passed a bare string to a %m conversion, which mongoose calls
+as a print function: any request with the wrong HTTP method jumped into
+rodata (InstructionFetchError in mg_pfn_iobuf) and rebooted the device.
+Also pass command results as a %s argument instead of as the format string.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/RestAPI/RestAPI/RestAPI.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/components/RestAPI/RestAPI/RestAPI.cpp b/components/RestAPI/RestAPI/RestAPI.cpp
+index 3ddde11..e1b622a 100644
+--- a/components/RestAPI/RestAPI/RestAPI.cpp
++++ b/components/RestAPI/RestAPI/RestAPI.cpp
+@@ -137,11 +137,14 @@ void RestAPI::handle_endpoint_command(RequestContext* context, std::string allow
+ {
+     if (context->method != allowed_method)
+     {
+-        mg_http_reply(context->connection, 401, JSON_RESPONSE, "{%m:%m}", MG_ESC("error"), "Method not allowed");
++        // both %m arguments must be MG_ESC(): a bare string here was called as a print function,
++        // so any request with the wrong method crashed the board (InstructionFetchError)
++        mg_http_reply(context->connection, 405, JSON_RESPONSE, "{%m:%m}", MG_ESC("error"), MG_ESC("Method not allowed"));
+         return;
+     }
+ 
+     const nlohmann::json result = command_manager->executeFromType(command_type, context->body);
+     const auto code = getIsSuccess(result) ? success_code : error_code;
+-    mg_http_reply(context->connection, code, JSON_RESPONSE, result.dump().c_str());
++    // pass the JSON as an argument, never as the format string: a '%' in any reply would be parsed
++    mg_http_reply(context->connection, code, JSON_RESPONSE, "%s", result.dump().c_str());
+ }
+\ No newline at end of file
+-- 
+2.54.0.windows.1
+

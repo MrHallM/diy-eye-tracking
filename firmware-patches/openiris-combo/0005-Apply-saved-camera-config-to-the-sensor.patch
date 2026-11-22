@@ -1,0 +1,81 @@
+From fe2485d51f92cd1c8bd67586d93ed143777b0ec2 Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 17:51:33 -0400
+Subject: [PATCH 05/19] Apply saved camera config to the sensor
+
+loadConfigData() was never called, so update_camera only wrote to NVS
+and the sensor always ran the hardcoded quality/gain. Apply it after
+sensor setup at boot and right after update_camera, and clamp the AGC
+gain to the sensor's 0-30 range.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/CameraManager/CameraManager/CameraManager.cpp   | 7 ++++++-
+ components/CameraManager/CameraManager/CameraManager.hpp   | 2 +-
+ .../CommandManager/commands/camera_commands.cpp            | 4 ++++
+ 3 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/components/CameraManager/CameraManager/CameraManager.cpp b/components/CameraManager/CameraManager/CameraManager.cpp
+index 835a97a..cc2f864 100644
+--- a/components/CameraManager/CameraManager/CameraManager.cpp
++++ b/components/CameraManager/CameraManager/CameraManager.cpp
+@@ -1,5 +1,7 @@
+ #include "CameraManager.hpp"
+ 
++#include <algorithm>
++
+ const char* CAMERA_MANAGER_TAG = "[CAMERA_MANAGER]";
+ 
+ CameraManager::CameraManager(std::shared_ptr<ProjectConfig> projectConfig, QueueHandle_t eventQueue) : projectConfig(projectConfig), eventQueue(eventQueue) {}
+@@ -188,6 +190,9 @@ bool CameraManager::setupCamera()
+ #endif
+ 
+     this->setupCameraSensor();
++    // apply the user's saved camera settings on top of the hardcoded defaults,
++    // otherwise update_camera only ever writes to NVS and never reaches the sensor
++    this->loadConfigData();
+     return true;
+ }
+ 
+@@ -199,7 +204,7 @@ void CameraManager::loadConfigData()
+     this->setVFlip(cameraConfig.vflip);
+     this->setCameraResolution(static_cast<framesize_t>(cameraConfig.framesize));
+     camera_sensor->set_quality(camera_sensor, cameraConfig.quality);
+-    camera_sensor->set_agc_gain(camera_sensor, cameraConfig.brightness);
++    camera_sensor->set_agc_gain(camera_sensor, std::min<int>(cameraConfig.brightness, 30));  // 0 to 30
+     ESP_LOGD(CAMERA_MANAGER_TAG, "Loading camera config data done");
+ }
+ 
+diff --git a/components/CameraManager/CameraManager/CameraManager.hpp b/components/CameraManager/CameraManager/CameraManager.hpp
+index 21c952a..8a02b0b 100644
+--- a/components/CameraManager/CameraManager/CameraManager.hpp
++++ b/components/CameraManager/CameraManager/CameraManager.hpp
+@@ -31,9 +31,9 @@ class CameraManager
+     int setVFlip(int direction);
+     int setHFlip(int direction);
+     int setVieWindow(int offsetX, int offsetY, int outputX, int outputY);
++    void loadConfigData();
+ 
+    private:
+-    void loadConfigData();
+     void setupCameraPinout();
+     void setupCameraSensor();
+ };
+diff --git a/components/CommandManager/CommandManager/commands/camera_commands.cpp b/components/CommandManager/CommandManager/commands/camera_commands.cpp
+index e17a175..5945bb7 100644
+--- a/components/CommandManager/CommandManager/commands/camera_commands.cpp
++++ b/components/CommandManager/CommandManager/commands/camera_commands.cpp
+@@ -11,5 +11,9 @@ CommandResult updateCameraCommand(std::shared_ptr<DependencyRegistry> registry,
+         payload.href.has_value() ? payload.href.value() : oldConfig.href, payload.quality.has_value() ? payload.quality.value() : oldConfig.quality,
+         payload.brightness.has_value() ? payload.brightness.value() : oldConfig.brightness);
+ 
++    // push the new settings to the sensor now, not just on the next boot
++    std::shared_ptr<CameraManager> cameraManager = registry->resolve<CameraManager>(DependencyType::camera_manager);
++    cameraManager->loadConfigData();
++
+     return CommandResult::getSuccessResult("Config updated");
+ }
+\ No newline at end of file
+-- 
+2.54.0.windows.1
+

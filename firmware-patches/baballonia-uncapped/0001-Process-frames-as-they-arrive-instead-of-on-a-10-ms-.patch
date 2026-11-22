@@ -1,0 +1,114 @@
+From e4d9b38faadcae213abba283e8ed486433ae9b01 Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:56:31 -0400
+Subject: [PATCH 1/6] Process frames as they arrive instead of on a 10 ms UI
+ timer
+
+The DispatcherTimer ticks every ~15.6 ms on Windows, capping processing near
+64 Hz however fast the camera is. Capture.SetRawMat now raises AnyFrameArrived
+and one coalesced update is posted to the UI thread per frame (pipelines stay
+single-threaded on the UI thread, so no locking is needed); the timer stays as
+a fallback. Measured with a 100 fps camera: 55.7 -> 98.3 face updates/s,
+median gap 15.8 -> 9.9 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Baballonia.SDK/Capture.cs                 |  7 +++++
+ .../Services/ProcessingLoopService.cs         | 26 +++++++++++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/src/Baballonia.SDK/Capture.cs b/src/Baballonia.SDK/Capture.cs
+index 5af1ce0..c999baf 100644
+--- a/src/Baballonia.SDK/Capture.cs
++++ b/src/Baballonia.SDK/Capture.cs
+@@ -51,7 +51,14 @@ public abstract class Capture(string source, ILogger logger) : IDisposable
+             _rawMat?.Dispose();
+             _rawMat = value;
+         }
++        AnyFrameArrived?.Invoke();
+     }
++
++    /// <summary>
++    /// Raised (on the capture's thread) whenever any capture source has a new frame, so processing
++    /// can run per frame instead of polling on a timer.
++    /// </summary>
++    public static event Action? AnyFrameArrived;
+     /// <summary>
+     /// Is this Capture source ready to produce data?
+     /// </summary>
+diff --git a/src/Baballonia/Services/ProcessingLoopService.cs b/src/Baballonia/Services/ProcessingLoopService.cs
+index bcb8930..c5b9f06 100644
+--- a/src/Baballonia/Services/ProcessingLoopService.cs
++++ b/src/Baballonia/Services/ProcessingLoopService.cs
+@@ -3,6 +3,7 @@ using Baballonia.Services.events;
+ using Baballonia.Services.Inference;
+ using Microsoft.Extensions.Logging;
+ using System;
++using System.Threading;
+ 
+ namespace Baballonia.Services;
+ 
+@@ -20,11 +21,16 @@ public class ProcessingLoopService : IDisposable
+     private readonly EyePipelineManager _eyePipelineManager;
+     private readonly IEyePipelineEventBus _eyePipelineEventBus;
+ 
++    // Fallback poll only. Frames are normally processed as they arrive (OnFrameArrived): on Windows
++    // this 10 ms timer really ticks every ~15.6 ms, which capped processing near 64 Hz.
+     private readonly DispatcherTimer _drawTimer = new()
+     {
+         Interval = TimeSpan.FromMilliseconds(10)
+     };
+ 
++    private int _updatePending;
++    private volatile bool _running = true;
++
+ 
+     public ProcessingLoopService(
+         ILogger<ProcessingLoopService> logger,
+@@ -42,6 +48,22 @@ public class ProcessingLoopService : IDisposable
+ 
+         _drawTimer.Tick += TimerEvent;
+         _drawTimer.Start();
++        Baballonia.SDK.Capture.AnyFrameArrived += OnFrameArrived;
++    }
++
++    // Runs on a capture thread: queue one update on the UI thread, where the pipelines are owned,
++    // unless one is already queued (it will pick up this frame too).
++    private void OnFrameArrived()
++    {
++        if (!_running || Interlocked.Exchange(ref _updatePending, 1) == 1)
++            return;
++
++        Dispatcher.UIThread.Post(() =>
++        {
++            Interlocked.Exchange(ref _updatePending, 0);
++            if (_running)
++                TimerEvent(null, EventArgs.Empty);
++        });
+     }
+ 
+     private void TimerEvent(object? s, EventArgs e)
+@@ -80,16 +102,20 @@ public class ProcessingLoopService : IDisposable
+ 
+     public void Start()
+     {
++        _running = true;
+         _drawTimer.Start();
+     }
+ 
+     public void Pause()
+     {
++        _running = false;
+         _drawTimer.Stop();
+     }
+ 
+     public void Dispose()
+     {
++        _running = false;
++        Baballonia.SDK.Capture.AnyFrameArrived -= OnFrameArrived;
+         _drawTimer.Stop();
+         _faceProcessingPipeline.VideoSource?.Dispose();
+         _eyeProcessingPipeline.VideoSource?.Dispose();
+-- 
+2.54.0.windows.1
+

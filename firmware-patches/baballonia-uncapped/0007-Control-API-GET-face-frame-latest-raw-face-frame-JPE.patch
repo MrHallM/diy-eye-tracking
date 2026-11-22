@@ -1,0 +1,165 @@
+From 9688b2ad3264059e0adc731104f9841706972698 Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 23:44:47 -0500
+Subject: [PATCH] Control API: GET /face/frame (latest raw face frame, JPEG)
+ and GET /face/latest (latest face outputs)
+
+Lets a helper such as a face follower watch the face camera without opening a second camera stream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Baballonia/Services/ControlApiService.cs | 90 ++++++++++++++++++--
+ 1 file changed, 85 insertions(+), 5 deletions(-)
+
+diff --git a/src/Baballonia/Services/ControlApiService.cs b/src/Baballonia/Services/ControlApiService.cs
+index 85708b3..ca82ca8 100644
+--- a/src/Baballonia/Services/ControlApiService.cs
++++ b/src/Baballonia/Services/ControlApiService.cs
+@@ -1,9 +1,11 @@
+ using Avalonia.Threading;
++using Baballonia.Services.events;
+ using Baballonia.Services.Inference;
+ using Baballonia.Services.Inference.Enums;
+ using Baballonia.Services.Inference.Models;
+ using Microsoft.Extensions.Hosting;
+ using Microsoft.Extensions.Logging;
++using OpenCvSharp;
+ using System;
+ using System.IO;
+ using System.Net;
+@@ -22,22 +24,62 @@ namespace Baballonia.Services;
+ ///   GET  /status     -> current transformation of face, left, right
+ ///   POST /transform  -> {"camera":"face|left|right", "roi":{"x","y","width","height"}, "rotationRadians",
+ ///                        "gamma", "useRedChannel", "useHorizontalFlip", "useVerticalFlip"}; any field may be omitted
++///   GET  /face/frame -> the latest RAW face camera frame (before crop), image/jpeg; X-Frame-Age-Ms header
++///   GET  /face/latest -> {"ageMs", "values":[45]} the latest face model outputs (filtered, before calibration)
++/// The two face endpoints let a helper (e.g. the face follower) watch the camera without opening a second camera
++/// stream, which the ESP32 boards handle badly.
+ /// Changes are live only: they are not saved, and the crop drawn in the UI doesn't follow them (dragging it there
+ /// overwrites them). Port: BABALLONIA_CONTROL_PORT, default 8899; set it to 0 to disable.
+ /// </summary>
+ public class ControlApiService(
+     FacePipelineManager facePipelineManager,
+     EyePipelineManager eyePipelineManager,
++    IFacePipelineEventBus facePipelineEventBus,
+     ILogger<ControlApiService> logger) : BackgroundService
+ {
+     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+ 
++    private readonly object _faceLock = new();
++    private Mat? _faceFrame;                  // latest raw frame copy (at most ~20 copies a second)
++    private long _faceFrameTicks;
++    private float[]? _faceValues;
++    private long _faceValuesTicks;
++
++    private void OnFaceFrame(FacePipelineEvents.NewFrameEvent e)
++    {
++        var now = Environment.TickCount64;
++        if (now - Interlocked.Read(ref _faceFrameTicks) < 50 || e.image.Empty())
++            return;
++        var copy = e.image.Clone();           // the pipeline disposes its frame right after publishing
++        Mat? old;
++        lock (_faceLock)
++        {
++            old = _faceFrame;
++            _faceFrame = copy;
++            _faceFrameTicks = now;
++        }
++        old?.Dispose();
++    }
++
++    private void OnFaceResult(FacePipelineEvents.NewFilteredResultEvent e)
++    {
++        var copy = (float[])e.result.Clone();
++        lock (_faceLock)
++        {
++            _faceValues = copy;
++            _faceValuesTicks = Environment.TickCount64;
++        }
++    }
++
+     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+     {
+         var port = int.TryParse(Environment.GetEnvironmentVariable("BABALLONIA_CONTROL_PORT"), out var p) ? p : 8899;
+         if (port == 0)
+             return;
+ 
++        facePipelineEventBus.Subscribe<FacePipelineEvents.NewFrameEvent>(OnFaceFrame);
++        facePipelineEventBus.Subscribe<FacePipelineEvents.NewFilteredResultEvent>(OnFaceResult);
++
+         var listener = new TcpListener(IPAddress.Loopback, port);
+         try
+         {
+@@ -74,10 +116,24 @@ public class ControlApiService(
+             {
+                 var stream = client.GetStream();
+                 var (method, path, body) = await ReadRequest(stream);
+-                var (status, json) = await Route(method, path, body);
+-                var payload = Encoding.UTF8.GetBytes(json);
+-                var head = $"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {payload.Length}\r\n" +
+-                           "Connection: close\r\n\r\n";
++                string status, contentType = "application/json", extra = "";
++                byte[] payload;
++                if (method == "GET" && path.TrimEnd('/') == "/face/frame")
++                {
++                    (status, payload, var ageMs) = EncodeFaceFrame();
++                    if (status.StartsWith("200"))
++                    {
++                        contentType = "image/jpeg";
++                        extra = $"X-Frame-Age-Ms: {ageMs}\r\n";
++                    }
++                }
++                else
++                {
++                    (status, var json) = await Route(method, path, body);
++                    payload = Encoding.UTF8.GetBytes(json);
++                }
++                var head = $"HTTP/1.1 {status}\r\nContent-Type: {contentType}\r\nContent-Length: {payload.Length}\r\n" +
++                           extra + "Connection: close\r\n\r\n";
+                 await stream.WriteAsync(Encoding.ASCII.GetBytes(head));
+                 await stream.WriteAsync(payload);
+             }
+@@ -131,6 +187,17 @@ public class ControlApiService(
+     private static int IndexOf(byte[] data, int length, ReadOnlySpan<byte> pattern) =>
+         data.AsSpan(0, length).IndexOf(pattern);
+ 
++    private (string status, byte[] payload, long ageMs) EncodeFaceFrame()
++    {
++        lock (_faceLock)
++        {
++            if (_faceFrame is null)
++                return ("409 Conflict", "{\"error\":\"no face frame yet (face camera not running?)\"}"u8.ToArray(), 0);
++            Cv2.ImEncode(".jpg", _faceFrame, out var jpg, new ImageEncodingParam(ImwriteFlags.JpegQuality, 95));
++            return ("200 OK", jpg, Environment.TickCount64 - _faceFrameTicks);
++        }
++    }
++
+     private async Task<(string status, string json)> Route(string method, string path, string body)
+     {
+         switch (method, path.TrimEnd('/'))
+@@ -162,8 +229,21 @@ public class ControlApiService(
+                     ? ("409 Conflict", "{\"error\":\"that camera has no pipeline yet (not started?)\"}")
+                     : ("200 OK", JsonSerializer.Serialize(result, JsonOptions));
+ 
++            case ("GET", "/face/latest"):
++                lock (_faceLock)
++                {
++                    if (_faceValues is null)
++                        return ("409 Conflict", "{\"error\":\"no face values yet\"}");
++                    return ("200 OK", JsonSerializer.Serialize(new
++                    {
++                        ageMs = Environment.TickCount64 - _faceValuesTicks,
++                        values = _faceValues,
++                    }, JsonOptions));
++                }
++
+             default:
+-                return ("404 Not Found", "{\"error\":\"use GET /status or POST /transform\"}");
++                return ("404 Not Found",
++                    "{\"error\":\"use GET /status, POST /transform, GET /face/frame or GET /face/latest\"}");
+         }
+     }
+ 
+-- 
+2.54.0.windows.1
+

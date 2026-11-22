@@ -1,0 +1,78 @@
+From 0d8c90198f111725d16b1e2e7a3275b4303eff2b Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:56:31 -0400
+Subject: [PATCH 2/6] Send OSC as soon as results exist and stop dropping
+ queued messages
+
+The sender polled with Task.Delay(10) (~15.6 ms on Windows) and drained the
+queue with ToArray() then Clear(), losing anything enqueued between the two.
+It now wakes on a semaphore released per processed frame and dequeues.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Services/ParameterSenderService.cs        | 26 ++++++++++++-------
+ 1 file changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/src/Baballonia/Services/ParameterSenderService.cs b/src/Baballonia/Services/ParameterSenderService.cs
+index ff56038..db764c7 100644
+--- a/src/Baballonia/Services/ParameterSenderService.cs
++++ b/src/Baballonia/Services/ParameterSenderService.cs
+@@ -25,6 +25,9 @@ public class ParameterSenderService : BackgroundService
+     private bool _useDfr;
+     private readonly ConcurrentQueue<OscMessage> _vrcftQueue = new();
+     private readonly ConcurrentQueue<OscMessage> _dfrQueue = new();
++    // released per processed frame, so results go out as soon as they exist instead of on a
++    // 10 ms poll (which on Windows waited ~15.6 ms)
++    private readonly SemaphoreSlim _queued = new(0);
+ 
+     // Expression parameter names
+     private readonly Dictionary<string, string> _eyeExpressionMap = new()
+@@ -123,7 +126,7 @@ public class ParameterSenderService : BackgroundService
+                 _sendNativeVrcEyeTracking = _localSettingsService.ReadSetting<bool>("VRC_UseNativeTracking");
+                 _useDfr = _localSettingsService.ReadSetting<bool>("AppSettings_UseDFR");
+                 await SendAndClearQueue(cancellationToken);
+-                await Task.Delay(10, cancellationToken);
++                await _queued.WaitAsync(100, cancellationToken);
+             }
+             catch (Exception)
+             {
+@@ -138,6 +141,8 @@ public class ParameterSenderService : BackgroundService
+             ProcessEyeExpressionData(expressions.EyeExpression);
+         if (expressions.FaceExpression != null)
+             ProcessFaceExpressionData(expressions.FaceExpression);
++        if (_queued.CurrentCount == 0)
++            _queued.Release();
+     }
+ 
+     private void ProcessEyeExpressionData(float[] expressions)
+@@ -210,16 +215,19 @@ public class ParameterSenderService : BackgroundService
+ 
+     private async Task SendAndClearQueue(CancellationToken cancellationToken)
+     {
++        // dequeue rather than ToArray() + Clear(): anything enqueued between those two calls was lost
+         if (!_vrcftQueue.IsEmpty)
+-        {
+-            await _vrcftModuleSendService.Send(_vrcftQueue.ToArray(), cancellationToken);
+-            _vrcftQueue.Clear();
+-        }
++            await _vrcftModuleSendService.Send(Drain(_vrcftQueue), cancellationToken);
+ 
+         if (!_dfrQueue.IsEmpty)
+-        {
+-            await _dfrSendService.Send(_dfrQueue.ToArray(), cancellationToken);
+-            _dfrQueue.Clear();
+-        }
++            await _dfrSendService.Send(Drain(_dfrQueue), cancellationToken);
++    }
++
++    private static OscMessage[] Drain(ConcurrentQueue<OscMessage> queue)
++    {
++        var messages = new List<OscMessage>(queue.Count);
++        while (queue.TryDequeue(out var msg))
++            messages.Add(msg);
++        return messages.ToArray();
+     }
+ }
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,155 @@
+From f78820cf5bc1b222ea03fca0dbe7b55953b12f5d Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 17:54:28 -0400
+Subject: [PATCH 2/2] Add an exposure setting to update_camera
+
+The OV2640 runs with manual exposure (AEC off) fixed at 300 of 1200.
+Expose it as camera_config.exposure (default 300, unchanged behaviour),
+saved to NVS and applied with the other camera settings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/CameraManager/CameraManager/CameraManager.cpp   | 1 +
+ components/CommandManager/CommandManager/CommandSchema.cpp | 5 +++++
+ components/CommandManager/CommandManager/CommandSchema.hpp | 1 +
+ .../CommandManager/commands/camera_commands.cpp            | 3 ++-
+ components/ProjectConfig/ProjectConfig/Models.hpp          | 7 +++++--
+ components/ProjectConfig/ProjectConfig/ProjectConfig.cpp   | 3 ++-
+ components/ProjectConfig/ProjectConfig/ProjectConfig.hpp   | 2 +-
+ 7 files changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/components/CameraManager/CameraManager/CameraManager.cpp b/components/CameraManager/CameraManager/CameraManager.cpp
+index cc2f864..a56e346 100644
+--- a/components/CameraManager/CameraManager/CameraManager.cpp
++++ b/components/CameraManager/CameraManager/CameraManager.cpp
+@@ -205,6 +205,7 @@ void CameraManager::loadConfigData()
+     this->setCameraResolution(static_cast<framesize_t>(cameraConfig.framesize));
+     camera_sensor->set_quality(camera_sensor, cameraConfig.quality);
+     camera_sensor->set_agc_gain(camera_sensor, std::min<int>(cameraConfig.brightness, 30));  // 0 to 30
++    camera_sensor->set_aec_value(camera_sensor, std::min<int>(cameraConfig.exposure, 1200));  // 0 to 1200
+     ESP_LOGD(CAMERA_MANAGER_TAG, "Loading camera config data done");
+ }
+ 
+diff --git a/components/CommandManager/CommandManager/CommandSchema.cpp b/components/CommandManager/CommandManager/CommandSchema.cpp
+index 8655520..a11acdd 100644
+--- a/components/CommandManager/CommandManager/CommandSchema.cpp
++++ b/components/CommandManager/CommandManager/CommandSchema.cpp
+@@ -85,6 +85,7 @@ void to_json(nlohmann::json& j, const UpdateCameraConfigPayload& payload)
+ {
+     j = nlohmann::json{
+         {"vflip", payload.vflip}, {"href", payload.href}, {"framesize", payload.framesize}, {"quality", payload.quality}, {"brightness", payload.brightness},
++        {"exposure", payload.exposure},
+     };
+ }
+ 
+@@ -110,4 +111,8 @@ void from_json(const nlohmann::json& j, UpdateCameraConfigPayload& payload)
+     {
+         payload.brightness = j.at("brightness").get<uint8_t>();
+     }
++    if (j.contains("exposure"))
++    {
++        payload.exposure = j.at("exposure").get<uint16_t>();
++    }
+ }
+\ No newline at end of file
+diff --git a/components/CommandManager/CommandManager/CommandSchema.hpp b/components/CommandManager/CommandManager/CommandSchema.hpp
+index 8dc508c..a587473 100644
+--- a/components/CommandManager/CommandManager/CommandSchema.hpp
++++ b/components/CommandManager/CommandManager/CommandSchema.hpp
+@@ -61,6 +61,7 @@ struct UpdateCameraConfigPayload : BasePayload
+     std::optional<uint8_t> framesize;
+     std::optional<uint8_t> quality;
+     std::optional<uint8_t> brightness;
++    std::optional<uint16_t> exposure;
+     // TODO add more options here
+ };
+ 
+diff --git a/components/CommandManager/CommandManager/commands/camera_commands.cpp b/components/CommandManager/CommandManager/commands/camera_commands.cpp
+index 5945bb7..96e9980 100644
+--- a/components/CommandManager/CommandManager/commands/camera_commands.cpp
++++ b/components/CommandManager/CommandManager/commands/camera_commands.cpp
+@@ -9,7 +9,8 @@ CommandResult updateCameraCommand(std::shared_ptr<DependencyRegistry> registry,
+     projectConfig->setCameraConfig(
+         payload.vflip.has_value() ? payload.vflip.value() : oldConfig.vflip, payload.framesize.has_value() ? payload.framesize.value() : oldConfig.framesize,
+         payload.href.has_value() ? payload.href.value() : oldConfig.href, payload.quality.has_value() ? payload.quality.value() : oldConfig.quality,
+-        payload.brightness.has_value() ? payload.brightness.value() : oldConfig.brightness);
++        payload.brightness.has_value() ? payload.brightness.value() : oldConfig.brightness,
++        payload.exposure.has_value() ? payload.exposure.value() : oldConfig.exposure);
+ 
+     // push the new settings to the sensor now, not just on the next boot
+     std::shared_ptr<CameraManager> cameraManager = registry->resolve<CameraManager>(DependencyType::camera_manager);
+diff --git a/components/ProjectConfig/ProjectConfig/Models.hpp b/components/ProjectConfig/ProjectConfig/Models.hpp
+index 5d6a598..aff0b25 100644
+--- a/components/ProjectConfig/ProjectConfig/Models.hpp
++++ b/components/ProjectConfig/ProjectConfig/Models.hpp
+@@ -133,6 +133,7 @@ struct CameraConfig_t : BaseConfigModel
+     uint8_t framesize;
+     uint8_t quality;
+     uint8_t brightness;
++    uint16_t exposure;  // manual AEC value, 0 to 1200
+ 
+     void load()
+     {
+@@ -141,6 +142,7 @@ struct CameraConfig_t : BaseConfigModel
+         this->framesize = this->pref->getInt("framesize", 5);
+         this->quality = this->pref->getInt("quality", 7);
+         this->brightness = this->pref->getInt("brightness", 2);
++        this->exposure = this->pref->getInt("exposure", 300);
+     };
+ 
+     void save() const
+@@ -150,14 +152,15 @@ struct CameraConfig_t : BaseConfigModel
+         this->pref->putInt("framesize", this->framesize);
+         this->pref->putInt("quality", this->quality);
+         this->pref->putInt("brightness", this->brightness);
++        this->pref->putInt("exposure", this->exposure);
+     };
+ 
+     std::string toRepresentation()
+     {
+         return Helpers::format_string(
+             "\"camera_config\": {\"vflip\": %d,\"framesize\": %d,\"href\": "
+-            "%d,\"quality\": %d,\"brightness\": %d}",
+-            this->vflip, this->framesize, this->href, this->quality, this->brightness);
++            "%d,\"quality\": %d,\"brightness\": %d,\"exposure\": %d}",
++            this->vflip, this->framesize, this->href, this->quality, this->brightness, this->exposure);
+     };
+ };
+ 
+diff --git a/components/ProjectConfig/ProjectConfig/ProjectConfig.cpp b/components/ProjectConfig/ProjectConfig/ProjectConfig.cpp
+index 560e260..3b2e126 100644
+--- a/components/ProjectConfig/ProjectConfig/ProjectConfig.cpp
++++ b/components/ProjectConfig/ProjectConfig/ProjectConfig.cpp
+@@ -114,7 +114,7 @@ void ProjectConfig::setMDNSConfig(const std::string& hostname)
+     this->config.mdns.save();
+ }
+ 
+-void ProjectConfig::setCameraConfig(const uint8_t vflip, const uint8_t framesize, const uint8_t href, const uint8_t quality, const uint8_t brightness)
++void ProjectConfig::setCameraConfig(const uint8_t vflip, const uint8_t framesize, const uint8_t href, const uint8_t quality, const uint8_t brightness, const uint16_t exposure)
+ {
+     ESP_LOGD(CONFIGURATION_TAG, "Updating camera config");
+     this->config.camera.vflip = vflip;
+@@ -122,6 +122,7 @@ void ProjectConfig::setCameraConfig(const uint8_t vflip, const uint8_t framesize
+     this->config.camera.framesize = framesize;
+     this->config.camera.quality = quality;
+     this->config.camera.brightness = brightness;
++    this->config.camera.exposure = exposure;
+     this->config.camera.save();
+ 
+     ESP_LOGD(CONFIGURATION_TAG, "Updating Camera config");
+diff --git a/components/ProjectConfig/ProjectConfig/ProjectConfig.hpp b/components/ProjectConfig/ProjectConfig/ProjectConfig.hpp
+index 33f128d..e1a5bd8 100644
+--- a/components/ProjectConfig/ProjectConfig/ProjectConfig.hpp
++++ b/components/ProjectConfig/ProjectConfig/ProjectConfig.hpp
+@@ -36,7 +36,7 @@ class ProjectConfig
+     void setOTAConfig(const std::string& OTALogin, const std::string& OTAPassword, int OTAPort);
+     void setLEDDUtyCycleConfig(int led_external_pwm_duty_cycle);
+     void setMDNSConfig(const std::string& hostname);
+-    void setCameraConfig(uint8_t vflip, uint8_t framesize, uint8_t href, uint8_t quality, uint8_t brightness);
++    void setCameraConfig(uint8_t vflip, uint8_t framesize, uint8_t href, uint8_t quality, uint8_t brightness, uint16_t exposure);
+     void setWifiConfig(const std::string& networkName, const std::string& ssid, const std::string& bssid, const std::string& password, uint8_t channel,
+                        uint8_t power);
+ 
+-- 
+2.54.0.windows.1
+

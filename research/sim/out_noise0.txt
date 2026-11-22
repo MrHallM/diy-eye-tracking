@@ -1,0 +1,24 @@
+loading... (noise white 0.0 + AR 0.0 -> 0.0 deg RMS per axis)
+154 recordings >= 2 min
+
+1. FLOOR: windowed centre estimate vs the session's own centre, NO drift (deg; median / 95th pct)
+   gate                                  30s           60s          120s          300s          600s
+   all samples                 2.48 /  8.98  1.98 /  7.18  1.55 /  5.47  1.10 /  3.56  0.71 /  2.51
+   fixations                   2.65 /  9.41  2.07 /  8.04  1.62 /  6.58  1.14 /  4.82  0.75 /  2.58
+   fix + head still            2.68 /  9.60  2.11 /  7.78  1.67 /  6.33  1.22 /  5.12  0.75 /  2.76
+   fix + still + >=0.5 s       2.57 /  8.01  2.05 /  6.98  1.58 /  5.58  1.09 /  4.07  0.72 /  3.09
+   fix + still, dur-weight     2.65 / 10.03  2.12 /  8.03  1.66 /  6.36  1.19 /  4.70  0.73 /  2.88
+
+2. TASKS: same person, two different tasks, true centre (fix + head still); 34 people with 2+ tasks, 288 pairs
+   horizontal median  1.51   75th  2.68   95th  4.89   max  8.26 deg
+   vertical   median  4.49   75th  8.35   95th 12.37   max 18.87 deg
+   2-D        median  5.00   75th  8.52   95th 12.88   max 19.23 deg
+   session centres across everyone: x mean -0.50 (SD 2.35), y mean -0.21 (SD 6.30) deg
+   per task (mean x, y):  browsing -0.5,-3.2  desk -1.2,+3.5  driving +0.9,+6.4  grocery -0.1,+0.9  lego -0.3,-2.1  navigation -1.1,+2.4  pokemon -0.6,-4.1  restaurant -1.5,-0.0  walk +1.1,+5.0
+
+3. STEP: sudden horizontal offset halfway through (recordings >= 10 min); detect when the estimate moves
+   past that window's 95th-pct floor. Time from the step to detection (s; median / 90th), detected %
+   gate 'fix + still + >=0.5 s', 77 recordings
+   window  60s (floor 95th 6.98 deg)   2 deg:   68/ 106s  26%   3 deg:   62/ 106s  26%   5 deg:   60/ 110s  43%
+   window 120s (floor 95th 5.58 deg)   2 deg:  105/ 186s  31%   3 deg:  117/ 221s  39%   5 deg:  105/ 179s  68%
+   window 300s (floor 95th 4.07 deg)   2 deg:  330/ 585s  48%   3 deg:  335/ 567s  69%   5 deg:  220/ 305s  92%

@@ -1,0 +1,132 @@
+From 524b86c3f3c04f975829792b6a09170828011295 Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:56:32 -0400
+Subject: [PATCH 4/6] Stop leaking Mats every frame; fix DualCameraSource
+ Start/Stop swap
+
+- SingleCameraSource never disposed the raw Mat after a colour conversion
+- FaceProcessingPipeline never disposed the frame
+- DualCameraSource leaked new frames, clones and resized copies of cached frames
+- DualCameraSource.Start() stopped both cameras and Stop() started them
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Inference/FaceProcessingPipeline.cs       |  3 +-
+ .../VideoSources/DualCameraSource.cs          | 30 ++++++++++++++-----
+ .../VideoSources/SingleCameraSource.cs        |  1 +
+ 3 files changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/src/Baballonia/Services/Inference/FaceProcessingPipeline.cs b/src/Baballonia/Services/Inference/FaceProcessingPipeline.cs
+index 4573dbe..e5bad5c 100644
+--- a/src/Baballonia/Services/Inference/FaceProcessingPipeline.cs
++++ b/src/Baballonia/Services/Inference/FaceProcessingPipeline.cs
+@@ -8,7 +8,8 @@ public class FaceProcessingPipeline(IFacePipelineEventBus facePipelineEventBus)
+ {
+     public float[]? RunUpdate()
+     {
+-        var frame = VideoSource?.GetFrame(ColorType.Gray8);
++        // the frame was never disposed here (once per frame); subscribers copy it synchronously
++        using var frame = VideoSource?.GetFrame(ColorType.Gray8);
+         if(frame == null)
+             return null;
+ 
+diff --git a/src/Baballonia/Services/Inference/VideoSources/DualCameraSource.cs b/src/Baballonia/Services/Inference/VideoSources/DualCameraSource.cs
+index 0cecf79..4444fd5 100644
+--- a/src/Baballonia/Services/Inference/VideoSources/DualCameraSource.cs
++++ b/src/Baballonia/Services/Inference/VideoSources/DualCameraSource.cs
+@@ -12,14 +12,15 @@ public class DualCameraSource : IVideoSource
+     private Mat? LastLeftImage;
+     private Mat? LastRightImage;
+ 
++    // these were swapped (Start stopped both cameras, Stop started them)
+     public bool Start()
+     {
+-        return (LeftCam?.Stop() ?? true) && (RightCam?.Stop() ?? true);
++        return (LeftCam?.Start() ?? true) && (RightCam?.Start() ?? true);
+     }
+ 
+     public bool Stop()
+     {
+-        return (LeftCam?.Start() ?? true) && (RightCam?.Start() ?? true);
++        return (LeftCam?.Stop() ?? true) && (RightCam?.Stop() ?? true);
+     }
+ 
+     // Here we try to acquire 2 images from both cameras and stitch them into a single image
+@@ -36,6 +37,11 @@ public class DualCameraSource : IVideoSource
+         var leftIsNew = leftImage != null;
+         var rightIsNew = rightImage != null;
+ 
++        // Mats created in this call (new frames and clones) are ours to dispose; the cached
++        // Last*Image ones are not. Several of these leaked once per frame before.
++        var ownLeft = leftImage != null;
++        var ownRight = rightImage != null;
++
+         leftImage ??= LastLeftImage;
+         rightImage ??= LastRightImage;
+ 
+@@ -46,11 +52,15 @@ public class DualCameraSource : IVideoSource
+                 return null;
+             case null:
+                 leftImage = rightImage.Clone();
++                ownLeft = true;
+                 break;
+             default:
+                 // Don't clone - preserve both cameras when both are available!
+                 if (rightImage == null)
++                {
+                     rightImage = leftImage.Clone();
++                    ownRight = true;
++                }
+                 break;
+         }
+ 
+@@ -58,12 +68,18 @@ public class DualCameraSource : IVideoSource
+         int minWidth = Math.Min(leftImage.Cols, rightImage.Cols);
+ 
+         if (leftImage.Empty() || rightImage.Empty())
++        {
++            if (ownLeft) leftImage.Dispose();
++            if (ownRight) rightImage.Dispose();
+             return null;
+-            
++        }
++
+         Mat resizedLeft = new Mat();
+         Mat resizedRight = new Mat();
+         Cv2.Resize(leftImage, resizedLeft, new Size(minWidth, minHeight));
+         Cv2.Resize(rightImage, resizedRight, new Size(minWidth, minHeight));
++        if (ownLeft) leftImage.Dispose();
++        if (ownRight) rightImage.Dispose();
+ 
+         int height = Math.Max(resizedRight.Rows, resizedLeft.Rows);
+         int width = resizedRight.Cols + resizedLeft.Cols;
+@@ -86,11 +102,9 @@ public class DualCameraSource : IVideoSource
+             LastRightImage = resizedRight.Clone();
+         }
+ 
+-        // Only dispose new images, not the cached LastImages
+-        if (leftIsNew)
+-            resizedLeft.Dispose();
+-        if (rightIsNew)
+-            resizedRight.Dispose();
++        // the cached LastImages are clones, so the resized Mats are always ours to dispose
++        resizedLeft.Dispose();
++        resizedRight.Dispose();
+ 
+         return result;
+     }
+diff --git a/src/Baballonia/Services/Inference/VideoSources/SingleCameraSource.cs b/src/Baballonia/Services/Inference/VideoSources/SingleCameraSource.cs
+index a00b398..63d7673 100644
+--- a/src/Baballonia/Services/Inference/VideoSources/SingleCameraSource.cs
++++ b/src/Baballonia/Services/Inference/VideoSources/SingleCameraSource.cs
+@@ -75,6 +75,7 @@ public class SingleCameraSource : IVideoSource
+                         ColorType.Rgb24 => ColorConversionCodes.BGR2RGB,
+                         ColorType.Rgba32 => ColorConversionCodes.BGR2RGBA,
+                     });
++            rawMat.Dispose();  // we own it (AcquireRawMat); it leaked once per frame
+             image = convertedMat;
+         }
+ 
+-- 
+2.54.0.windows.1
+

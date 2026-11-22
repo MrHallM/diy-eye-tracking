@@ -1,0 +1,124 @@
+From 0d293360fc92f9c5bca41b9ad06970738480532f Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 19:55:59 -0400
+Subject: [PATCH 15/19] Add debug commands: sensor_reg and set_xclk
+
+Read/write OV2640 registers (bit 8 = sensor bank) and change XCLK at runtime,
+over serial or POST /api/debug/reg/ and /api/debug/xclk/, for live tuning
+experiments without reflashing. Not saved.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../CommandManager/CommandManager.cpp         |  6 ++++
+ .../CommandManager/CommandManager.hpp         |  2 ++
+ .../commands/camera_commands.cpp              | 28 +++++++++++++++++++
+ .../commands/camera_commands.hpp              |  4 +++
+ components/RestAPI/RestAPI/RestAPI.cpp        |  2 ++
+ 5 files changed, 42 insertions(+)
+
+diff --git a/components/CommandManager/CommandManager/CommandManager.cpp b/components/CommandManager/CommandManager/CommandManager.cpp
+index 126a97a..8a2faa6 100644
+--- a/components/CommandManager/CommandManager/CommandManager.cpp
++++ b/components/CommandManager/CommandManager/CommandManager.cpp
+@@ -29,6 +29,8 @@ std::unordered_map<std::string, CommandType> commandTypeMap = {
+     {"get_battery_status", CommandType::GET_BATTERY_STATUS},
+     {"get_who_am_i", CommandType::GET_WHO_AM_I},
+     {"set_zoom", CommandType::SET_ZOOM},
++    {"sensor_reg", CommandType::SENSOR_REG},
++    {"set_xclk", CommandType::SET_XCLK},
+ };
+ 
+ std::function<CommandResult()> CommandManager::createCommand(const CommandType type, const nlohmann::json& json) const
+@@ -89,6 +91,10 @@ std::function<CommandResult()> CommandManager::createCommand(const CommandType t
+         return [this] { return getInfoCommand(this->registry); };
+     case CommandType::SET_ZOOM:
+         return [this, json] { return setZoomCommand(this->registry, json); };
++    case CommandType::SENSOR_REG:
++        return [this, json] { return sensorRegCommand(this->registry, json); };
++    case CommandType::SET_XCLK:
++        return [this, json] { return setXclkCommand(this->registry, json); };
+     default:
+         return nullptr;
+     }
+diff --git a/components/CommandManager/CommandManager/CommandManager.hpp b/components/CommandManager/CommandManager/CommandManager.hpp
+index 542be12..1b0281f 100644
+--- a/components/CommandManager/CommandManager/CommandManager.hpp
++++ b/components/CommandManager/CommandManager/CommandManager.hpp
+@@ -50,6 +50,8 @@ enum class CommandType
+     GET_BATTERY_STATUS,
+     GET_WHO_AM_I,
+     SET_ZOOM,
++    SENSOR_REG,
++    SET_XCLK,
+ };
+ 
+ class CommandManager
+diff --git a/components/CommandManager/CommandManager/commands/camera_commands.cpp b/components/CommandManager/CommandManager/commands/camera_commands.cpp
+index 4b8fb1a..a151e1a 100644
+--- a/components/CommandManager/CommandManager/commands/camera_commands.cpp
++++ b/components/CommandManager/CommandManager/commands/camera_commands.cpp
+@@ -30,4 +30,32 @@ CommandResult setZoomCommand(std::shared_ptr<DependencyRegistry> registry, const
+         return CommandResult::getErrorResult("Invalid zoom window");
+ 
+     return CommandResult::getSuccessResult(size ? "Zoom set" : "Zoom off");
++}
++
++CommandResult sensorRegCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json)
++{
++    if (!json.contains("reg"))
++        return CommandResult::getErrorResult("Missing reg");
++
++    const int reg = json.at("reg").get<int>();  // bit 8 selects the OV2640 sensor bank, else DSP bank
++    const int mask = json.value("mask", 0xFF);
++    sensor_t* sensor = esp_camera_sensor_get();
++    if (!sensor)
++        return CommandResult::getErrorResult("No sensor");
++
++    if (json.contains("value") && sensor->set_reg(sensor, reg, mask, json.at("value").get<int>()) < 0)
++        return CommandResult::getErrorResult("Register write failed");
++
++    return CommandResult::getSuccessResult(std::to_string(sensor->get_reg(sensor, reg, mask)));
++}
++
++CommandResult setXclkCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json)
++{
++    const int mhz = json.value("mhz", 0);
++    sensor_t* sensor = esp_camera_sensor_get();
++    if (!sensor || mhz < 6 || mhz > 40)
++        return CommandResult::getErrorResult("mhz must be 6-40");
++    if (sensor->set_xclk(sensor, LEDC_TIMER_0, mhz) != ESP_OK)
++        return CommandResult::getErrorResult("XCLK change failed");
++    return CommandResult::getSuccessResult("XCLK set");
+ }
+\ No newline at end of file
+diff --git a/components/CommandManager/CommandManager/commands/camera_commands.hpp b/components/CommandManager/CommandManager/commands/camera_commands.hpp
+index 43c7c3e..cb9d03f 100644
+--- a/components/CommandManager/CommandManager/commands/camera_commands.hpp
++++ b/components/CommandManager/CommandManager/commands/camera_commands.hpp
+@@ -13,5 +13,9 @@
+ CommandResult updateCameraCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json);
+ // {"x", "y", "size"} in SVGA (800x600) sensor pixels; size 0 restores the full view. Not saved.
+ CommandResult setZoomCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json);
++// debug: read (and with "value", write) a sensor register; {"reg", "mask", "value"}
++CommandResult sensorRegCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json);
++// debug: change the camera XCLK at runtime; {"mhz"}
++CommandResult setXclkCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json);
+ 
+ #endif
+\ No newline at end of file
+diff --git a/components/RestAPI/RestAPI/RestAPI.cpp b/components/RestAPI/RestAPI/RestAPI.cpp
+index e1b622a..ccafcee 100644
+--- a/components/RestAPI/RestAPI/RestAPI.cpp
++++ b/components/RestAPI/RestAPI/RestAPI.cpp
+@@ -52,6 +52,8 @@ RestAPI::RestAPI(std::string url, std::shared_ptr<CommandManager> commandManager
+     routes.emplace("/api/set/config/save/", RequestBaseData(POST_METHOD, CommandType::SAVE_CONFIG, 200, 400));
+     routes.emplace("/api/set/wifi/connect/", RequestBaseData(POST_METHOD, CommandType::CONNECT_WIFI, 200, 400));
+     routes.emplace("/api/set/zoom/", RequestBaseData(POST_METHOD, CommandType::SET_ZOOM, 200, 400));
++    routes.emplace("/api/debug/reg/", RequestBaseData(POST_METHOD, CommandType::SENSOR_REG, 200, 400));
++    routes.emplace("/api/debug/xclk/", RequestBaseData(POST_METHOD, CommandType::SET_XCLK, 200, 400));
+ 
+     // resets via POST as well
+     routes.emplace("/api/reset/config/", RequestBaseData(POST_METHOD, CommandType::RESET_CONFIG, 200, 400));
+-- 
+2.54.0.windows.1
+

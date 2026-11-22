@@ -1,0 +1,39 @@
+From 9b429e85c5da708c8e88289d1beb608482e3059b Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:56:32 -0400
+Subject: [PATCH 5/6] Fall back to auto-detecting the capture provider
+
+Provider names were renamed (IpCameraCapture -> Wireless/IP Camera), so a saved
+LastOpenedPreferredCapture* from an older version made the camera fail to start
+(No provider is compatible). Also fix the error message printing the null
+provider instead of the requested name.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Baballonia/Factories/SingleCameraSourceFactory.cs | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/Baballonia/Factories/SingleCameraSourceFactory.cs b/src/Baballonia/Factories/SingleCameraSourceFactory.cs
+index f1f95b5..430455c 100644
+--- a/src/Baballonia/Factories/SingleCameraSourceFactory.cs
++++ b/src/Baballonia/Factories/SingleCameraSourceFactory.cs
+@@ -30,10 +30,14 @@ public class SingleCameraSourceFactory
+         ICaptureFactory? provider;
+         if (!string.IsNullOrEmpty(providerName))
+         {
++            // Fall back to auto-detection when the saved name is unknown: provider names were renamed
++            // (e.g. "IpCameraCapture" -> "Wireless/IP Camera"), so settings from older versions
++            // stopped the camera from starting at all.
+             provider = _platformConnector.GetCaptureFactories()
+-                .FirstOrDefault(factory => factory.GetProviderName() == providerName && factory.CanConnect(address));
++                           .FirstOrDefault(factory => factory.GetProviderName() == providerName && factory.CanConnect(address))
++                       ?? _platformConnector.GetCaptureFactories().FirstOrDefault(factory => factory.CanConnect(address));
+             if(provider == null)
+-                throw new ArgumentNullException($"No provider \"{provider}\" is not compatible with \"{address}\"");
++                throw new ArgumentNullException($"No provider \"{providerName}\" is compatible with \"{address}\"");
+ 
+         }
+         else
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,35 @@
+From 0c044dbc99cbd2755590e9ff9c330cc9bb4ec9b3 Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 21:06:21 -0400
+Subject: [PATCH 18/19] Stream: a new client starts from the next fresh frame
+
+The capture task idles while nobody streams, so the shared latest frame can be
+minutes old; new clients were sent it first (seen as stale board_ts frames).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/StreamServer/StreamServer/StreamServer.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/components/StreamServer/StreamServer/StreamServer.cpp b/components/StreamServer/StreamServer/StreamServer.cpp
+index cddde2a..11861a1 100644
+--- a/components/StreamServer/StreamServer/StreamServer.cpp
++++ b/components/StreamServer/StreamServer/StreamServer.cpp
+@@ -271,7 +271,13 @@ void ClientTask(void* param)
+     auto* req = static_cast<httpd_req_t*>(param);
+     QueueHandle_t eventQueue = hub.ctx.stateManager ? hub.ctx.stateManager->GetEventQueue() : nullptr;
+ 
+-    uint32_t lastSent = 0;
++    // start from the current frame, not 0: the capture task idles with no clients, so the latest
++    // frame can be minutes old and a new viewer would get it first
++    uint32_t lastSent;
++    {
++        std::lock_guard<std::mutex> lock(hub.mutex);
++        lastSent = hub.sequence;
++    }
+     while (true)
+     {
+         std::shared_ptr<const SharedFrame> frame;
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,181 @@
+From e114811130cdc1b91dad746874ba0b4c3ef5cdfe Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 19:38:57 -0400
+Subject: [PATCH 12/19] Sensor-side zoom: implement setVieWindow, add set_zoom
+
+Reads a window of the OV2640 in SVGA mode (2x the detail of the CIF mode
+the 240x240 stream uses) and scales it to the output size. set_zoom
+{x, y, size} in SVGA pixels over serial or POST /api/set/zoom/; size 0
+restores the full view. Not saved. Gain/exposure are re-applied after each
+mode switch since it rewrites the register tables.
+
+Measured (XIAO OV2640, 240x240): full view 66.8 fps, zoomed 33.3 fps -
+SVGA mode reads twice the lines per frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../CameraManager/CameraManager.cpp           | 35 ++++++++++++++++---
+ .../CameraManager/CameraManager.hpp           |  1 +
+ .../CommandManager/CommandManager.cpp         |  3 ++
+ .../CommandManager/CommandManager.hpp         |  1 +
+ .../commands/camera_commands.cpp              | 13 +++++++
+ .../commands/camera_commands.hpp              |  6 ++--
+ components/RestAPI/RestAPI/RestAPI.cpp        |  1 +
+ 7 files changed, 53 insertions(+), 7 deletions(-)
+
+diff --git a/components/CameraManager/CameraManager/CameraManager.cpp b/components/CameraManager/CameraManager/CameraManager.cpp
+index da931e6..ba9b37a 100644
+--- a/components/CameraManager/CameraManager/CameraManager.cpp
++++ b/components/CameraManager/CameraManager/CameraManager.cpp
+@@ -346,8 +346,7 @@ void CameraManager::loadConfigData()
+     this->setVFlip(cameraConfig.vflip);
+     this->setCameraResolution(static_cast<framesize_t>(cameraConfig.framesize));
+     camera_sensor->set_quality(camera_sensor, cameraConfig.quality);
+-    camera_sensor->set_agc_gain(camera_sensor, std::min<int>(cameraConfig.brightness, 30));  // 0 to 30
+-    camera_sensor->set_aec_value(camera_sensor, std::min<int>(cameraConfig.exposure, 1200));  // 0 to 1200
++    this->applyGainAndExposure();
+     ESP_LOGD(CAMERA_MANAGER_TAG, "Loading camera config data done");
+ }
+ 
+@@ -370,10 +369,38 @@ int CameraManager::setHFlip(const int direction)
+     return camera_sensor->set_hmirror(camera_sensor, direction);
+ }
+ 
++// Sensor-side zoom: read a window of the sensor at SVGA detail (2x the CIF mode the 240x240
++// stream normally uses) and scale it to the configured output size. Window is in SVGA pixels
++// (800x600 covers the whole sensor); width 0 goes back to the normal full view.
+ int CameraManager::setVieWindow(int offsetX, int offsetY, int outputX, int outputY)
+ {
+-    // todo safariMonkey made a PoC, implement it here
+-    return 0;
++    if (outputX == 0)
++    {
++        const int ret = this->setCameraResolution(static_cast<framesize_t>(projectConfig->getCameraConfig().framesize));
++        this->applyGainAndExposure();  // the mode switch rewrites the sensor's register tables
++        return ret;
++    }
++
++    constexpr int SVGA_W = 800;
++    constexpr int SVGA_H = 600;
++    constexpr int OV2640_MODE_SVGA = 1;  // ov2640_sensor_mode_t, private to the driver
++    if (camera_sensor->id.PID != OV2640_PID || offsetX < 0 || offsetY < 0 || outputX < 8 || outputY < 8 || offsetX + outputX > SVGA_W ||
++        offsetY + outputY > SVGA_H)
++    {
++        return -1;
++    }
++
++    const auto& res = resolution[camera_sensor->status.framesize];
++    const int ret = camera_sensor->set_res_raw(camera_sensor, OV2640_MODE_SVGA, 0, 0, 0, offsetX, offsetY, outputX, outputY, res.width, res.height, false, false);
++    this->applyGainAndExposure();
++    return ret;
++}
++
++void CameraManager::applyGainAndExposure()
++{
++    const CameraConfig_t& cameraConfig = projectConfig->getCameraConfig();
++    camera_sensor->set_agc_gain(camera_sensor, std::min<int>(cameraConfig.brightness, 30));    // 0 to 30
++    camera_sensor->set_aec_value(camera_sensor, std::min<int>(cameraConfig.exposure, 1200));  // 0 to 1200
+ }
+ 
+ esp_err_t CameraManager::getLastCameraError() const
+diff --git a/components/CameraManager/CameraManager/CameraManager.hpp b/components/CameraManager/CameraManager/CameraManager.hpp
+index ad2d84b..f78db24 100644
+--- a/components/CameraManager/CameraManager/CameraManager.hpp
++++ b/components/CameraManager/CameraManager/CameraManager.hpp
+@@ -59,6 +59,7 @@ class CameraManager
+     void setupCameraPinout();
+     void setupCameraSensor();
+     void generateDiagnosticFrame();
++    void applyGainAndExposure();
+ };
+ 
+ #endif  // CAMERAMANAGER_HPP
+\ No newline at end of file
+diff --git a/components/CommandManager/CommandManager/CommandManager.cpp b/components/CommandManager/CommandManager/CommandManager.cpp
+index 11d36ee..126a97a 100644
+--- a/components/CommandManager/CommandManager/CommandManager.cpp
++++ b/components/CommandManager/CommandManager/CommandManager.cpp
+@@ -28,6 +28,7 @@ std::unordered_map<std::string, CommandType> commandTypeMap = {
+     {"get_led_current", CommandType::GET_LED_CURRENT},
+     {"get_battery_status", CommandType::GET_BATTERY_STATUS},
+     {"get_who_am_i", CommandType::GET_WHO_AM_I},
++    {"set_zoom", CommandType::SET_ZOOM},
+ };
+ 
+ std::function<CommandResult()> CommandManager::createCommand(const CommandType type, const nlohmann::json& json) const
+@@ -86,6 +87,8 @@ std::function<CommandResult()> CommandManager::createCommand(const CommandType t
+         return [this] { return getBatteryStatusCommand(this->registry); };
+     case CommandType::GET_WHO_AM_I:
+         return [this] { return getInfoCommand(this->registry); };
++    case CommandType::SET_ZOOM:
++        return [this, json] { return setZoomCommand(this->registry, json); };
+     default:
+         return nullptr;
+     }
+diff --git a/components/CommandManager/CommandManager/CommandManager.hpp b/components/CommandManager/CommandManager/CommandManager.hpp
+index c74e3ff..542be12 100644
+--- a/components/CommandManager/CommandManager/CommandManager.hpp
++++ b/components/CommandManager/CommandManager/CommandManager.hpp
+@@ -49,6 +49,7 @@ enum class CommandType
+     GET_LED_CURRENT,
+     GET_BATTERY_STATUS,
+     GET_WHO_AM_I,
++    SET_ZOOM,
+ };
+ 
+ class CommandManager
+diff --git a/components/CommandManager/CommandManager/commands/camera_commands.cpp b/components/CommandManager/CommandManager/commands/camera_commands.cpp
+index 96e9980..4b8fb1a 100644
+--- a/components/CommandManager/CommandManager/commands/camera_commands.cpp
++++ b/components/CommandManager/CommandManager/commands/camera_commands.cpp
+@@ -17,4 +17,17 @@ CommandResult updateCameraCommand(std::shared_ptr<DependencyRegistry> registry,
+     cameraManager->loadConfigData();
+ 
+     return CommandResult::getSuccessResult("Config updated");
++}
++
++CommandResult setZoomCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json)
++{
++    const int x = json.value("x", 0);
++    const int y = json.value("y", 0);
++    const int size = json.value("size", 0);
++
++    std::shared_ptr<CameraManager> cameraManager = registry->resolve<CameraManager>(DependencyType::camera_manager);
++    if (cameraManager->setVieWindow(x, y, size, size) != 0)
++        return CommandResult::getErrorResult("Invalid zoom window");
++
++    return CommandResult::getSuccessResult(size ? "Zoom set" : "Zoom off");
+ }
+\ No newline at end of file
+diff --git a/components/CommandManager/CommandManager/commands/camera_commands.hpp b/components/CommandManager/CommandManager/commands/camera_commands.hpp
+index 7dd5e57..43c7c3e 100644
+--- a/components/CommandManager/CommandManager/commands/camera_commands.hpp
++++ b/components/CommandManager/CommandManager/commands/camera_commands.hpp
+@@ -11,7 +11,7 @@
+ #include "DependencyRegistry.hpp"
+ 
+ CommandResult updateCameraCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json);
++// {"x", "y", "size"} in SVGA (800x600) sensor pixels; size 0 restores the full view. Not saved.
++CommandResult setZoomCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json);
+ 
+-#endif
+-
+-// add cropping command
+\ No newline at end of file
++#endif
+\ No newline at end of file
+diff --git a/components/RestAPI/RestAPI/RestAPI.cpp b/components/RestAPI/RestAPI/RestAPI.cpp
+index 3b11b60..3ddde11 100644
+--- a/components/RestAPI/RestAPI/RestAPI.cpp
++++ b/components/RestAPI/RestAPI/RestAPI.cpp
+@@ -51,6 +51,7 @@ RestAPI::RestAPI(std::string url, std::shared_ptr<CommandManager> commandManager
+     routes.emplace("/api/set/mdns/", RequestBaseData(POST_METHOD, CommandType::SET_MDNS, 200, 400));
+     routes.emplace("/api/set/config/save/", RequestBaseData(POST_METHOD, CommandType::SAVE_CONFIG, 200, 400));
+     routes.emplace("/api/set/wifi/connect/", RequestBaseData(POST_METHOD, CommandType::CONNECT_WIFI, 200, 400));
++    routes.emplace("/api/set/zoom/", RequestBaseData(POST_METHOD, CommandType::SET_ZOOM, 200, 400));
+ 
+     // resets via POST as well
+     routes.emplace("/api/reset/config/", RequestBaseData(POST_METHOD, CommandType::RESET_CONFIG, 200, 400));
+-- 
+2.54.0.windows.1
+

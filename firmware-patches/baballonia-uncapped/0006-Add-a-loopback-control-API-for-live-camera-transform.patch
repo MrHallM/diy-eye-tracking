@@ -1,0 +1,285 @@
+From cb13c10d4be4d2e1f314c2a35eed42e2d8f4f34e Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 21:11:47 -0400
+Subject: [PATCH 6/6] Add a loopback control API for live camera
+ transformations
+
+ControlApiService listens on 127.0.0.1:8899 (BABALLONIA_CONTROL_PORT, 0 = off):
+GET /status returns the face/left/right CameraSettings, POST /transform changes
+any of roi/rotation/gamma/red channel/flips live, applied on the UI thread
+through the same pipeline-manager setters the crop UI uses. For an external
+continuous re-centering tool. Live only: not saved, and the UI crop doesn't follow.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/Baballonia/App.axaml.cs                   |   1 +
+ src/Baballonia/Services/ControlApiService.cs  | 213 ++++++++++++++++++
+ src/Baballonia/Services/EyePipelineManager.cs |   6 +
+ .../Services/Inference/FacePipelineManager.cs |   2 +
+ 4 files changed, 222 insertions(+)
+ create mode 100644 src/Baballonia/Services/ControlApiService.cs
+
+diff --git a/src/Baballonia/App.axaml.cs b/src/Baballonia/App.axaml.cs
+index 991492a..b9e4ea3 100644
+--- a/src/Baballonia/App.axaml.cs
++++ b/src/Baballonia/App.axaml.cs
+@@ -161,6 +161,7 @@ public partial class App : Application
+ 
+             services.AddHostedService(provider => provider.GetService<OscRecvService>()!);
+             services.AddHostedService(provider => provider.GetService<ParameterSenderService>()!);
++            services.AddHostedService<ControlApiService>();
+ 
+             // Configuration
+             IConfiguration config = new ConfigurationBuilder()
+diff --git a/src/Baballonia/Services/ControlApiService.cs b/src/Baballonia/Services/ControlApiService.cs
+new file mode 100644
+index 0000000..85708b3
+--- /dev/null
++++ b/src/Baballonia/Services/ControlApiService.cs
+@@ -0,0 +1,213 @@
++using Avalonia.Threading;
++using Baballonia.Services.Inference;
++using Baballonia.Services.Inference.Enums;
++using Baballonia.Services.Inference.Models;
++using Microsoft.Extensions.Hosting;
++using Microsoft.Extensions.Logging;
++using System;
++using System.IO;
++using System.Net;
++using System.Net.Sockets;
++using System.Text;
++using System.Text.Json;
++using System.Text.Json.Nodes;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace Baballonia.Services;
++
++/// <summary>
++/// Loopback-only control API so outside tools (e.g. a continuous re-centering / calibration helper) can read and
++/// change each camera's transformation (crop, rotation, gamma, flips) while Baballonia runs.
++///   GET  /status     -> current transformation of face, left, right
++///   POST /transform  -> {"camera":"face|left|right", "roi":{"x","y","width","height"}, "rotationRadians",
++///                        "gamma", "useRedChannel", "useHorizontalFlip", "useVerticalFlip"}; any field may be omitted
++/// Changes are live only: they are not saved, and the crop drawn in the UI doesn't follow them (dragging it there
++/// overwrites them). Port: BABALLONIA_CONTROL_PORT, default 8899; set it to 0 to disable.
++/// </summary>
++public class ControlApiService(
++    FacePipelineManager facePipelineManager,
++    EyePipelineManager eyePipelineManager,
++    ILogger<ControlApiService> logger) : BackgroundService
++{
++    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
++
++    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
++    {
++        var port = int.TryParse(Environment.GetEnvironmentVariable("BABALLONIA_CONTROL_PORT"), out var p) ? p : 8899;
++        if (port == 0)
++            return;
++
++        var listener = new TcpListener(IPAddress.Loopback, port);
++        try
++        {
++            listener.Start();
++        }
++        catch (SocketException ex)
++        {
++            logger.LogWarning("Control API not started, port {Port} unavailable: {Message}", port, ex.Message);
++            return;
++        }
++        logger.LogInformation("Control API listening on http://127.0.0.1:{Port}/", port);
++
++        using var stopRegistration = stoppingToken.Register(listener.Stop);
++        while (!stoppingToken.IsCancellationRequested)
++        {
++            TcpClient client;
++            try
++            {
++                client = await listener.AcceptTcpClientAsync(stoppingToken);
++            }
++            catch (Exception) when (stoppingToken.IsCancellationRequested)
++            {
++                break;
++            }
++            _ = Task.Run(() => HandleClient(client), stoppingToken);
++        }
++    }
++
++    private async Task HandleClient(TcpClient client)
++    {
++        using (client)
++        {
++            try
++            {
++                var stream = client.GetStream();
++                var (method, path, body) = await ReadRequest(stream);
++                var (status, json) = await Route(method, path, body);
++                var payload = Encoding.UTF8.GetBytes(json);
++                var head = $"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {payload.Length}\r\n" +
++                           "Connection: close\r\n\r\n";
++                await stream.WriteAsync(Encoding.ASCII.GetBytes(head));
++                await stream.WriteAsync(payload);
++            }
++            catch (Exception ex)
++            {
++                logger.LogDebug("Control API request failed: {Message}", ex.Message);
++            }
++        }
++    }
++
++    private static async Task<(string method, string path, string body)> ReadRequest(NetworkStream stream)
++    {
++        var buffer = new MemoryStream();
++        var chunk = new byte[4096];
++        int headerEnd;
++        while (true)
++        {
++            var n = await stream.ReadAsync(chunk);
++            if (n == 0)
++                throw new IOException("connection closed before the request ended");
++            buffer.Write(chunk, 0, n);
++            headerEnd = IndexOf(buffer.GetBuffer(), (int)buffer.Length, "\r\n\r\n"u8);
++            if (headerEnd >= 0)
++                break;
++            if (buffer.Length > 65536)
++                throw new IOException("request header too large");
++        }
++
++        var head = Encoding.ASCII.GetString(buffer.GetBuffer(), 0, headerEnd);
++        var lines = head.Split("\r\n");
++        var requestLine = lines[0].Split(' ');
++        var contentLength = 0;
++        foreach (var line in lines)
++            if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
++                contentLength = int.Parse(line["Content-Length:".Length..].Trim());
++        if (contentLength > 65536)
++            throw new IOException("request body too large");
++
++        var bodyStart = headerEnd + 4;
++        while (buffer.Length < bodyStart + contentLength)
++        {
++            var n = await stream.ReadAsync(chunk);
++            if (n == 0)
++                break;
++            buffer.Write(chunk, 0, n);
++        }
++        var body = Encoding.UTF8.GetString(buffer.GetBuffer(), bodyStart, (int)Math.Min(contentLength, buffer.Length - bodyStart));
++        return (requestLine[0], requestLine.Length > 1 ? requestLine[1] : "/", body);
++    }
++
++    private static int IndexOf(byte[] data, int length, ReadOnlySpan<byte> pattern) =>
++        data.AsSpan(0, length).IndexOf(pattern);
++
++    private async Task<(string status, string json)> Route(string method, string path, string body)
++    {
++        switch (method, path.TrimEnd('/'))
++        {
++            case ("GET", "/status"):
++                var state = await Dispatcher.UIThread.InvokeAsync(() => new
++                {
++                    face = facePipelineManager.GetTransformation(),
++                    left = eyePipelineManager.GetLeftTransformation(),
++                    right = eyePipelineManager.GetRightTransformation(),
++                });
++                return ("200 OK", JsonSerializer.Serialize(state, JsonOptions));
++
++            case ("POST", "/transform"):
++                JsonNode? request;
++                try
++                {
++                    request = JsonNode.Parse(body);
++                }
++                catch (JsonException)
++                {
++                    return ("400 Bad Request", "{\"error\":\"invalid JSON\"}");
++                }
++                if (request?["camera"]?.GetValue<string>() is not { } camera)
++                    return ("400 Bad Request", "{\"error\":\"missing camera (face, left or right)\"}");
++
++                var result = await Dispatcher.UIThread.InvokeAsync(() => ApplyTransform(camera.ToLowerInvariant(), request));
++                return result is null
++                    ? ("409 Conflict", "{\"error\":\"that camera has no pipeline yet (not started?)\"}")
++                    : ("200 OK", JsonSerializer.Serialize(result, JsonOptions));
++
++            default:
++                return ("404 Not Found", "{\"error\":\"use GET /status or POST /transform\"}");
++        }
++    }
++
++    // UI thread: the pipelines are owned there
++    private CameraSettings? ApplyTransform(string camera, JsonNode request)
++    {
++        var current = camera switch
++        {
++            "face" => facePipelineManager.GetTransformation(),
++            "left" => eyePipelineManager.GetLeftTransformation(),
++            "right" => eyePipelineManager.GetRightTransformation(),
++            _ => null,
++        };
++        if (current is null)
++            return null;
++
++        var roi = current.Roi;
++        if (request["roi"] is JsonObject r)
++        {
++            roi = roi with
++            {
++                X = r["x"]?.GetValue<int>() ?? roi.X,
++                Y = r["y"]?.GetValue<int>() ?? roi.Y,
++                Width = r["width"]?.GetValue<int>() ?? roi.Width,
++                Height = r["height"]?.GetValue<int>() ?? roi.Height,
++            };
++        }
++
++        var updated = current with
++        {
++            Roi = roi,
++            RotationRadians = request["rotationRadians"]?.GetValue<float>() ?? current.RotationRadians,
++            Gamma = request["gamma"]?.GetValue<float>() ?? current.Gamma,
++            UseRedChannel = request["useRedChannel"]?.GetValue<bool>() ?? current.UseRedChannel,
++            UseHorizontalFlip = request["useHorizontalFlip"]?.GetValue<bool>() ?? current.UseHorizontalFlip,
++            UseVerticalFlip = request["useVerticalFlip"]?.GetValue<bool>() ?? current.UseVerticalFlip,
++        };
++
++        switch (camera)
++        {
++            case "face": facePipelineManager.SetTransformation(updated); break;
++            case "left": eyePipelineManager.SetLeftTransformation(updated); break;
++            case "right": eyePipelineManager.SetRightTransformation(updated); break;
++        }
++        return updated;
++    }
++}
+diff --git a/src/Baballonia/Services/EyePipelineManager.cs b/src/Baballonia/Services/EyePipelineManager.cs
+index 8d3c9e3..2c18101 100644
+--- a/src/Baballonia/Services/EyePipelineManager.cs
++++ b/src/Baballonia/Services/EyePipelineManager.cs
+@@ -119,6 +119,12 @@ public class EyePipelineManager
+         }
+     }
+ 
++    public CameraSettings? GetLeftTransformation() =>
++        (_pipeline.ImageTransformer as DualImageTransformer)?.LeftTransformer.Transformation;
++
++    public CameraSettings? GetRightTransformation() =>
++        (_pipeline.ImageTransformer as DualImageTransformer)?.RightTransformer.Transformation;
++
+     public async Task<bool> StartLeftVideoSource(string cameraAddress, string preferredBackend)
+     {
+         if (string.IsNullOrEmpty(cameraAddress))
+diff --git a/src/Baballonia/Services/Inference/FacePipelineManager.cs b/src/Baballonia/Services/Inference/FacePipelineManager.cs
+index 2064c8d..8b56317 100644
+--- a/src/Baballonia/Services/Inference/FacePipelineManager.cs
++++ b/src/Baballonia/Services/Inference/FacePipelineManager.cs
+@@ -98,6 +98,8 @@ public class FacePipelineManager
+         }
+     }
+ 
++    public CameraSettings? GetTransformation() => (_pipeline.ImageTransformer as ImageTransformer)?.Transformation;
++
+     public async Task<bool> StartVideoSource(string cameraAddress, string preferredBackend)
+     {
+         if (string.IsNullOrEmpty(cameraAddress))
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,68 @@
+From 579dd35ccd4ef710b02ff70afaab912cdd1c1d0b Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 19:55:59 -0400
+Subject: [PATCH 14/19] Zoom: keep the window across loadConfigData()
+
+update_camera re-applies the frame size, which silently switched an active
+zoom back to the full view. Remember the window and restore it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../CameraManager/CameraManager/CameraManager.cpp      | 10 ++++++++++
+ .../CameraManager/CameraManager/CameraManager.hpp      |  5 +++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/components/CameraManager/CameraManager/CameraManager.cpp b/components/CameraManager/CameraManager/CameraManager.cpp
+index ba9b37a..a11bbfc 100644
+--- a/components/CameraManager/CameraManager/CameraManager.cpp
++++ b/components/CameraManager/CameraManager/CameraManager.cpp
+@@ -347,6 +347,9 @@ void CameraManager::loadConfigData()
+     this->setCameraResolution(static_cast<framesize_t>(cameraConfig.framesize));
+     camera_sensor->set_quality(camera_sensor, cameraConfig.quality);
+     this->applyGainAndExposure();
++    // setCameraResolution() switched the sensor back to the full view; restore an active zoom
++    if (zoomSize > 0)
++        this->setVieWindow(zoomX, zoomY, zoomSize, zoomSize);
+     ESP_LOGD(CAMERA_MANAGER_TAG, "Loading camera config data done");
+ }
+ 
+@@ -376,6 +379,7 @@ int CameraManager::setVieWindow(int offsetX, int offsetY, int outputX, int outpu
+ {
+     if (outputX == 0)
+     {
++        zoomSize = 0;
+         const int ret = this->setCameraResolution(static_cast<framesize_t>(projectConfig->getCameraConfig().framesize));
+         this->applyGainAndExposure();  // the mode switch rewrites the sensor's register tables
+         return ret;
+@@ -393,6 +397,12 @@ int CameraManager::setVieWindow(int offsetX, int offsetY, int outputX, int outpu
+     const auto& res = resolution[camera_sensor->status.framesize];
+     const int ret = camera_sensor->set_res_raw(camera_sensor, OV2640_MODE_SVGA, 0, 0, 0, offsetX, offsetY, outputX, outputY, res.width, res.height, false, false);
+     this->applyGainAndExposure();
++    if (ret == 0)
++    {
++        zoomX = offsetX;
++        zoomY = offsetY;
++        zoomSize = outputX;
++    }
+     return ret;
+ }
+ 
+diff --git a/components/CameraManager/CameraManager/CameraManager.hpp b/components/CameraManager/CameraManager/CameraManager.hpp
+index f78db24..051129d 100644
+--- a/components/CameraManager/CameraManager/CameraManager.hpp
++++ b/components/CameraManager/CameraManager/CameraManager.hpp
+@@ -29,6 +29,11 @@ class CameraManager
+     size_t diagnosticJpegLen = 0;
+     bool cameraOk = false;
+ 
++    // active sensor zoom window (SVGA pixels), 0 = full view; kept across loadConfigData()
++    int zoomX = 0;
++    int zoomY = 0;
++    int zoomSize = 0;
++
+    public:
+     CameraManager(std::shared_ptr<ProjectConfig> projectConfig, QueueHandle_t eventQueue);
+     int setCameraResolution(framesize_t frameSize);
+-- 
+2.54.0.windows.1
+

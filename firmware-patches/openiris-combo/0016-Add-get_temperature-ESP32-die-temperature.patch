@@ -1,0 +1,133 @@
+From fa126e3a3744473c05bb3cb2b15910754d3c48e5 Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:16:47 -0400
+Subject: [PATCH 16/19] Add get_temperature (ESP32 die temperature)
+
+Serial get_temperature or GET /api/get/temperature/, for heat comparisons
+between camera clock settings. Reads the ESP32 chip, not the camera module.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ components/CommandManager/CMakeLists.txt      |  2 +-
+ .../CommandManager/CommandManager.cpp         |  3 +++
+ .../CommandManager/CommandManager.hpp         |  1 +
+ .../commands/camera_commands.cpp              | 23 +++++++++++++++++++
+ .../commands/camera_commands.hpp              |  3 +++
+ components/RestAPI/RestAPI/RestAPI.cpp        |  1 +
+ 6 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/components/CommandManager/CMakeLists.txt b/components/CommandManager/CMakeLists.txt
+index 6de7ed4..cb0abf1 100644
+--- a/components/CommandManager/CMakeLists.txt
++++ b/components/CommandManager/CMakeLists.txt
+@@ -13,5 +13,5 @@ idf_component_register(
+   INCLUDE_DIRS
+      "CommandManager"
+      "CommandManager/commands"
+-  REQUIRES ProjectConfig nlohmann-json CameraManager OpenIrisTasks wifiManager Helpers LEDManager Monitoring
++  REQUIRES esp_driver_tsens ProjectConfig nlohmann-json CameraManager OpenIrisTasks wifiManager Helpers LEDManager Monitoring
+ )
+\ No newline at end of file
+diff --git a/components/CommandManager/CommandManager/CommandManager.cpp b/components/CommandManager/CommandManager/CommandManager.cpp
+index 8a2faa6..923afa8 100644
+--- a/components/CommandManager/CommandManager/CommandManager.cpp
++++ b/components/CommandManager/CommandManager/CommandManager.cpp
+@@ -31,6 +31,7 @@ std::unordered_map<std::string, CommandType> commandTypeMap = {
+     {"set_zoom", CommandType::SET_ZOOM},
+     {"sensor_reg", CommandType::SENSOR_REG},
+     {"set_xclk", CommandType::SET_XCLK},
++    {"get_temperature", CommandType::GET_TEMPERATURE},
+ };
+ 
+ std::function<CommandResult()> CommandManager::createCommand(const CommandType type, const nlohmann::json& json) const
+@@ -95,6 +96,8 @@ std::function<CommandResult()> CommandManager::createCommand(const CommandType t
+         return [this, json] { return sensorRegCommand(this->registry, json); };
+     case CommandType::SET_XCLK:
+         return [this, json] { return setXclkCommand(this->registry, json); };
++    case CommandType::GET_TEMPERATURE:
++        return [this] { return getTemperatureCommand(this->registry); };
+     default:
+         return nullptr;
+     }
+diff --git a/components/CommandManager/CommandManager/CommandManager.hpp b/components/CommandManager/CommandManager/CommandManager.hpp
+index 1b0281f..83f6224 100644
+--- a/components/CommandManager/CommandManager/CommandManager.hpp
++++ b/components/CommandManager/CommandManager/CommandManager.hpp
+@@ -52,6 +52,7 @@ enum class CommandType
+     SET_ZOOM,
+     SENSOR_REG,
+     SET_XCLK,
++    GET_TEMPERATURE,
+ };
+ 
+ class CommandManager
+diff --git a/components/CommandManager/CommandManager/commands/camera_commands.cpp b/components/CommandManager/CommandManager/commands/camera_commands.cpp
+index a151e1a..9e39d23 100644
+--- a/components/CommandManager/CommandManager/commands/camera_commands.cpp
++++ b/components/CommandManager/CommandManager/commands/camera_commands.cpp
+@@ -49,6 +49,29 @@ CommandResult sensorRegCommand(std::shared_ptr<DependencyRegistry> registry, con
+     return CommandResult::getSuccessResult(std::to_string(sensor->get_reg(sensor, reg, mask)));
+ }
+ 
++CommandResult getTemperatureCommand(std::shared_ptr<DependencyRegistry> registry)
++{
++    // ESP32 die temperature (not the camera module's); installed once, on first use
++    static temperature_sensor_handle_t tsens = nullptr;
++    if (!tsens)
++    {
++        temperature_sensor_config_t config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
++        if (temperature_sensor_install(&config, &tsens) != ESP_OK || temperature_sensor_enable(tsens) != ESP_OK)
++        {
++            tsens = nullptr;
++            return CommandResult::getErrorResult("Temperature sensor unavailable");
++        }
++    }
++
++    float celsius = 0;
++    if (temperature_sensor_get_celsius(tsens, &celsius) != ESP_OK)
++        return CommandResult::getErrorResult("Temperature read failed");
++
++    char buf[16];
++    snprintf(buf, sizeof(buf), "%.1f", celsius);
++    return CommandResult::getSuccessResult(buf);
++}
++
+ CommandResult setXclkCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json)
+ {
+     const int mhz = json.value("mhz", 0);
+diff --git a/components/CommandManager/CommandManager/commands/camera_commands.hpp b/components/CommandManager/CommandManager/commands/camera_commands.hpp
+index cb9d03f..e42fe07 100644
+--- a/components/CommandManager/CommandManager/commands/camera_commands.hpp
++++ b/components/CommandManager/CommandManager/commands/camera_commands.hpp
+@@ -9,6 +9,7 @@
+ #include "CommandResult.hpp"
+ #include "CommandSchema.hpp"
+ #include "DependencyRegistry.hpp"
++#include "driver/temperature_sensor.h"
+ 
+ CommandResult updateCameraCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json);
+ // {"x", "y", "size"} in SVGA (800x600) sensor pixels; size 0 restores the full view. Not saved.
+@@ -17,5 +18,7 @@ CommandResult setZoomCommand(std::shared_ptr<DependencyRegistry> registry, const
+ CommandResult sensorRegCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json);
+ // debug: change the camera XCLK at runtime; {"mhz"}
+ CommandResult setXclkCommand(std::shared_ptr<DependencyRegistry> registry, const nlohmann::json& json);
++// ESP32 chip temperature in °C as a string (the chip, not the camera module)
++CommandResult getTemperatureCommand(std::shared_ptr<DependencyRegistry> registry);
+ 
+ #endif
+\ No newline at end of file
+diff --git a/components/RestAPI/RestAPI/RestAPI.cpp b/components/RestAPI/RestAPI/RestAPI.cpp
+index ccafcee..3786188 100644
+--- a/components/RestAPI/RestAPI/RestAPI.cpp
++++ b/components/RestAPI/RestAPI/RestAPI.cpp
+@@ -65,6 +65,7 @@ RestAPI::RestAPI(std::string url, std::shared_ptr<CommandManager> commandManager
+     routes.emplace("/api/get/serial_number/", RequestBaseData(GET_METHOD, CommandType::GET_SERIAL, 200, 400));
+     routes.emplace("/api/get/led_current/", RequestBaseData(GET_METHOD, CommandType::GET_LED_CURRENT, 200, 400));
+     routes.emplace("/api/get/who_am_i/", RequestBaseData(GET_METHOD, CommandType::GET_WHO_AM_I, 200, 400));
++    routes.emplace("/api/get/temperature/", RequestBaseData(GET_METHOD, CommandType::GET_TEMPERATURE, 200, 400));
+ 
+     // deletes via DELETE
+     routes.emplace("/api/delete/wifi", RequestBaseData(DELETE_METHOD, CommandType::DELETE_NETWORK, 200, 400));
+-- 
+2.54.0.windows.1
+

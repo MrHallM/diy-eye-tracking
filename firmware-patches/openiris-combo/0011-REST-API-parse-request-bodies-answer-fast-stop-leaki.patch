@@ -1,0 +1,106 @@
+From 07dcb5b8a56d40af71ce34d377d26a5776f88a69 Mon Sep 17 00:00:00 2001
+From: Mr_Hall <174105745+MrHallM@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 19:38:57 -0400
+Subject: [PATCH 11/19] REST API: parse request bodies, answer fast, stop
+ leaking
+
+- executeFromType passed the body string_view straight into createCommand,
+  where nlohmann::json wrapped it as a JSON string: every REST command saw
+  no fields (PATCH led_duty_cycle with a valid body returned 400).
+- the poll task slept vTaskDelay(1000) (1 s at 1 kHz ticks) between polls,
+  so every request took ~2 s; now 20-300 ms.
+- RequestContext was new-ed per request and never deleted.
+- poll task stack 2024*2 (typo) -> 1024*6 like the serial command task;
+  a camera PATCH could hang the task.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../CommandManager/CommandManager.cpp              | 14 +++++++++++++-
+ components/RestAPI/RestAPI/RestAPI.cpp             | 12 ++++++++----
+ main/openiris_main.cpp                             |  3 ++-
+ 3 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/components/CommandManager/CommandManager/CommandManager.cpp b/components/CommandManager/CommandManager/CommandManager.cpp
+index 295eca3..11d36ee 100644
+--- a/components/CommandManager/CommandManager/CommandManager.cpp
++++ b/components/CommandManager/CommandManager/CommandManager.cpp
+@@ -135,7 +135,19 @@ CommandManagerResponse CommandManager::executeFromJson(const std::string_view js
+ 
+ CommandManagerResponse CommandManager::executeFromType(const CommandType type, const std::string_view json) const
+ {
+-    const auto command = createCommand(type, json);
++    // Parse the body. Passing the string_view straight through made nlohmann::json wrap it as a
++    // JSON *string*, so every command reached over the REST API saw no fields at all.
++    nlohmann::json payload = nlohmann::json::object();
++    if (!json.empty())
++    {
++        if (!nlohmann::json::accept(json))
++        {
++            return CommandManagerResponse(nlohmann::json{{"result", CommandResult::getErrorResult("Invalid JSON body")}});
++        }
++        payload = nlohmann::json::parse(json);
++    }
++
++    const auto command = createCommand(type, payload);
+ 
+     if (command == nullptr)
+     {
+diff --git a/components/RestAPI/RestAPI/RestAPI.cpp b/components/RestAPI/RestAPI/RestAPI.cpp
+index 992a762..3b11b60 100644
+--- a/components/RestAPI/RestAPI/RestAPI.cpp
++++ b/components/RestAPI/RestAPI/RestAPI.cpp
+@@ -97,12 +97,13 @@ void RestAPI::handle_request(struct mg_connection* connection, int event, void*
+ 
+         auto const base_request_params = this->routes.at(uri);
+ 
+-        auto* context = new RequestContext{
++        // on the stack: this was `new`-ed and never deleted, leaking every request
++        RequestContext context{
+             .connection = connection,
+             .method = std::string(message->method.buf, message->method.len),
+             .body = std::string(message->body.buf, message->body.len),
+         };
+-        this->handle_endpoint_command(context, base_request_params.allowed_method, base_request_params.command_type, base_request_params.success_code,
++        this->handle_endpoint_command(&context, base_request_params.allowed_method, base_request_params.command_type, base_request_params.success_code,
+                                       base_request_params.error_code);
+     }
+ }
+@@ -115,7 +116,8 @@ void RestAPIHelpers::event_handler(struct mg_connection* connection, int event,
+ 
+ void RestAPI::poll()
+ {
+-    mg_mgr_poll(&mgr, 100);
++    // mg_mgr_poll blocks in select() for up to the timeout, so this idles without spinning
++    mg_mgr_poll(&mgr, 50);
+ }
+ 
+ void HandleRestAPIPollTask(void* pvParameter)
+@@ -123,8 +125,10 @@ void HandleRestAPIPollTask(void* pvParameter)
+     auto* rest_api_handler = static_cast<RestAPI*>(pvParameter);
+     while (true)
+     {
++        // no extra delay: the old vTaskDelay(1000) (1 s at 1 kHz ticks) between polls made
++        // every request take ~2 s, since accepting and answering need separate polls
+         rest_api_handler->poll();
+-        vTaskDelay(1000);
++        vTaskDelay(1);
+     }
+ }
+ 
+diff --git a/main/openiris_main.cpp b/main/openiris_main.cpp
+index 9e78313..20b3180 100644
+--- a/main/openiris_main.cpp
++++ b/main/openiris_main.cpp
+@@ -220,7 +220,8 @@ void startWiFiMode()
+     {
+         streamServer.startStreamServer();
+     }
+-    xTaskCreate(HandleRestAPIPollTask, "HandleRestAPIPollTask", 2024 * 2, restAPI.get(),
++    // 6 KB like the serial command task: commands parse JSON and may reconfigure the camera
++    xTaskCreate(HandleRestAPIPollTask, "HandleRestAPIPollTask", 1024 * 6, restAPI.get(),
+                 1,  // it's the rest API, we only serve commands over it so we don't really need a higher priority
+                 nullptr);
+ #else
+-- 
+2.54.0.windows.1
+
